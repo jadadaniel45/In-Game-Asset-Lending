@@ -10,6 +10,9 @@
 (define-constant ERR_INSUFFICIENT_PAYMENT (err u413))
 (define-constant ERR_INVALID_DURATION (err u414))
 (define-constant ERR_ASSET_NOT_AVAILABLE (err u415))
+(define-constant ERR_ALREADY_RATED (err u416))
+(define-constant ERR_INVALID_RATING (err u417))
+(define-constant ERR_CANNOT_RATE (err u418))
 
 (define-data-var contract-fee-rate uint u500)
 (define-data-var min-lending-duration uint u144)
@@ -54,6 +57,25 @@
 
 (define-map listing-counter principal uint)
 
+(define-map user-reputation
+  principal
+  {
+    total-rating: uint,
+    rating-count: uint,
+    completed-loans: uint
+  }
+)
+
+(define-map loan-ratings
+  uint
+  {
+    lender-rated: bool,
+    borrower-rated: bool,
+    lender-rating: uint,
+    borrower-rating: uint
+  }
+)
+
 (define-read-only (get-contract-fee-rate)
   (var-get contract-fee-rate)
 )
@@ -80,6 +102,28 @@
 
 (define-read-only (get-user-loans (user principal))
   (default-to (list) (map-get? user-active-loans user))
+)
+
+(define-read-only (get-user-reputation (user principal))
+  (default-to { total-rating: u0, rating-count: u0, completed-loans: u0 } (map-get? user-reputation user))
+)
+
+(define-read-only (get-loan-rating (loan-id uint))
+  (map-get? loan-ratings loan-id)
+)
+
+(define-read-only (get-average-rating (user principal))
+  (let
+    (
+      (reputation (get-user-reputation user))
+      (total (get total-rating reputation))
+      (count (get rating-count reputation))
+    )
+    (if (> count u0)
+      (some (/ (* total u100) count))
+      none
+    )
+  )
 )
 
 (define-read-only (calculate-loan-cost (daily-rate uint) (duration uint))
@@ -268,6 +312,15 @@
           (merge listing-data { available: true })
         )
         
+        (map-set loan-ratings loan-id
+          {
+            lender-rated: false,
+            borrower-rated: false,
+            lender-rating: u0,
+            borrower-rating: u0
+          }
+        )
+        
         (ok true)
       )
       ERR_NOT_FOUND
@@ -329,6 +382,84 @@
         )
         
         (ok true)
+      )
+      ERR_NOT_FOUND
+    )
+    ERR_NOT_FOUND
+  )
+)
+
+(define-public (rate-borrower (loan-id uint) (rating uint))
+  (match (map-get? active-loans loan-id)
+    loan-data
+    (match (map-get? asset-listings (get listing-id loan-data))
+      listing-data
+      (match (map-get? loan-ratings loan-id)
+        rating-data
+        (let
+          (
+            (borrower (get borrower loan-data))
+            (borrower-rep (get-user-reputation borrower))
+          )
+          (asserts! (is-eq tx-sender (get owner listing-data)) ERR_UNAUTHORIZED)
+          (asserts! (get returned loan-data) ERR_CANNOT_RATE)
+          (asserts! (not (get lender-rated rating-data)) ERR_ALREADY_RATED)
+          (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+          
+          (map-set loan-ratings loan-id
+            (merge rating-data { lender-rated: true, borrower-rating: rating })
+          )
+          
+          (map-set user-reputation borrower
+            {
+              total-rating: (+ (get total-rating borrower-rep) rating),
+              rating-count: (+ (get rating-count borrower-rep) u1),
+              completed-loans: (+ (get completed-loans borrower-rep) u1)
+            }
+          )
+          
+          (ok true)
+        )
+        ERR_CANNOT_RATE
+      )
+      ERR_NOT_FOUND
+    )
+    ERR_NOT_FOUND
+  )
+)
+
+(define-public (rate-lender (loan-id uint) (rating uint))
+  (match (map-get? active-loans loan-id)
+    loan-data
+    (match (map-get? asset-listings (get listing-id loan-data))
+      listing-data
+      (match (map-get? loan-ratings loan-id)
+        rating-data
+        (let
+          (
+            (lender (get owner listing-data))
+            (lender-rep (get-user-reputation lender))
+          )
+          (asserts! (is-eq tx-sender (get borrower loan-data)) ERR_UNAUTHORIZED)
+          (asserts! (get returned loan-data) ERR_CANNOT_RATE)
+          (asserts! (not (get borrower-rated rating-data)) ERR_ALREADY_RATED)
+          (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+          
+          (map-set loan-ratings loan-id
+            (merge rating-data { borrower-rated: true, lender-rating: rating })
+          )
+          
+          (map-set user-reputation lender
+            {
+              total-rating: (+ (get total-rating lender-rep) rating),
+              rating-count: (+ (get rating-count lender-rep) u1),
+              completed-loans: (+ (get completed-loans lender-rep) u1)
+            }
+          )
+          
+          (ok true)
+        )
+        ERR_CANNOT_RATE
       )
       ERR_NOT_FOUND
     )
