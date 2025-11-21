@@ -13,11 +13,17 @@
 (define-constant ERR_ALREADY_RATED (err u416))
 (define-constant ERR_INVALID_RATING (err u417))
 (define-constant ERR_CANNOT_RATE (err u418))
+(define-constant ERR_DISPUTE_EXISTS (err u419))
+(define-constant ERR_NO_DISPUTE (err u420))
+(define-constant ERR_DISPUTE_RESOLVED (err u421))
+(define-constant ERR_PENALTY_PAID (err u422))
 
 (define-data-var contract-fee-rate uint u500)
 (define-data-var min-lending-duration uint u144)
 (define-data-var max-lending-duration uint u52560)
 (define-data-var next-loan-id uint u1)
+(define-data-var penalty-rate uint u2000)
+(define-data-var dispute-window uint u1008)
 
 (define-map asset-listings
   uint
@@ -76,6 +82,19 @@
   }
 )
 
+(define-map loan-disputes
+  uint
+  {
+    initiated-by: principal,
+    reason: (string-ascii 256),
+    dispute-block: uint,
+    resolved: bool,
+    resolution: (string-ascii 256),
+    penalty-amount: uint,
+    penalty-paid: bool
+  }
+)
+
 (define-read-only (get-contract-fee-rate)
   (var-get contract-fee-rate)
 )
@@ -110,6 +129,27 @@
 
 (define-read-only (get-loan-rating (loan-id uint))
   (map-get? loan-ratings loan-id)
+)
+
+(define-read-only (get-loan-dispute (loan-id uint))
+  (map-get? loan-disputes loan-id)
+)
+
+(define-read-only (get-penalty-rate)
+  (var-get penalty-rate)
+)
+
+(define-read-only (get-dispute-window)
+  (var-get dispute-window)
+)
+
+(define-read-only (calculate-penalty (loan-cost uint))
+  (let
+    (
+      (penalty (* loan-cost (var-get penalty-rate)))
+    )
+    (/ penalty u10000)
+  )
 )
 
 (define-read-only (get-average-rating (user principal))
@@ -158,6 +198,21 @@
     (asserts! (< min-duration max-duration) ERR_INVALID_DURATION)
     (var-set min-lending-duration min-duration)
     (ok (var-set max-lending-duration max-duration))
+  )
+)
+
+(define-public (set-penalty-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-rate u5000) ERR_INVALID_AMOUNT)
+    (ok (var-set penalty-rate new-rate))
+  )
+)
+
+(define-public (set-dispute-window (new-window uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (ok (var-set dispute-window new-window))
   )
 )
 
@@ -464,6 +519,94 @@
       ERR_NOT_FOUND
     )
     ERR_NOT_FOUND
+  )
+)
+
+(define-public (initiate-dispute (loan-id uint) (reason (string-ascii 256)))
+  (match (map-get? active-loans loan-id)
+    loan-data
+    (match (map-get? asset-listings (get listing-id loan-data))
+      listing-data
+      (let
+        (
+          (penalty (calculate-penalty (get total-cost loan-data)))
+          (is-lender (is-eq tx-sender (get owner listing-data)))
+          (is-borrower (is-eq tx-sender (get borrower loan-data)))
+        )
+        (asserts! (or is-lender is-borrower) ERR_UNAUTHORIZED)
+        (asserts! (is-none (map-get? loan-disputes loan-id)) ERR_DISPUTE_EXISTS)
+        (asserts! (< stacks-block-height (+ (get end-block loan-data) (var-get dispute-window))) ERR_EXPIRED)
+        
+        (map-set loan-disputes loan-id
+          {
+            initiated-by: tx-sender,
+            reason: reason,
+            dispute-block: stacks-block-height,
+            resolved: false,
+            resolution: "",
+            penalty-amount: penalty,
+            penalty-paid: false
+          }
+        )
+        
+        (ok true)
+      )
+      ERR_NOT_FOUND
+    )
+    ERR_NOT_FOUND
+  )
+)
+
+(define-public (resolve-dispute (loan-id uint) (resolution (string-ascii 256)) (penalize-borrower bool))
+  (match (map-get? loan-disputes loan-id)
+    dispute-data
+    (match (map-get? active-loans loan-id)
+      loan-data
+      (match (map-get? asset-listings (get listing-id loan-data))
+        listing-data
+        (begin
+          (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+          (asserts! (not (get resolved dispute-data)) ERR_DISPUTE_RESOLVED)
+          
+          (map-set loan-disputes loan-id
+            (merge dispute-data { resolved: true, resolution: resolution })
+          )
+          
+          (ok penalize-borrower)
+        )
+        ERR_NOT_FOUND
+      )
+      ERR_NOT_FOUND
+    )
+    ERR_NO_DISPUTE
+  )
+)
+
+(define-public (pay-dispute-penalty (loan-id uint))
+  (match (map-get? loan-disputes loan-id)
+    dispute-data
+    (match (map-get? active-loans loan-id)
+      loan-data
+      (match (map-get? asset-listings (get listing-id loan-data))
+        listing-data
+        (begin
+          (asserts! (is-eq tx-sender (get borrower loan-data)) ERR_UNAUTHORIZED)
+          (asserts! (get resolved dispute-data) ERR_NO_DISPUTE)
+          (asserts! (not (get penalty-paid dispute-data)) ERR_PENALTY_PAID)
+          
+          (try! (stx-transfer? (get penalty-amount dispute-data) tx-sender (get owner listing-data)))
+          
+          (map-set loan-disputes loan-id
+            (merge dispute-data { penalty-paid: true })
+          )
+          
+          (ok true)
+        )
+        ERR_NOT_FOUND
+      )
+      ERR_NOT_FOUND
+    )
+    ERR_NO_DISPUTE
   )
 )
 
